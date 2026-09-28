@@ -316,17 +316,28 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5"
-                || mapped == "claude-fable-5" =>
+                // 5 代及其小版本（opus-5.5、sonnet-5.2…）统一 1M，避免逐个漏配。
+                || is_claude_gen5_1m(&mapped) =>
         {
             1_000_000
         }
         _ => 200_000,
     }
+}
+
+/// 规范化后的 `claude-{sonnet|opus|fable}-5` 或 `-5.x`（如 `claude-opus-5.5`）。
+fn is_claude_gen5_1m(mapped: &str) -> bool {
+    ["claude-sonnet-", "claude-opus-", "claude-fable-"]
+        .iter()
+        .filter_map(|prefix| mapped.strip_prefix(prefix))
+        .any(|version| {
+            let mut parts = version.split('.');
+            parts.next() == Some("5")
+                && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        })
 }
 
 fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
@@ -2213,6 +2224,10 @@ mod tests {
             "claude-opus-4-8",
             "claude-opus-5",
             "claude-fable-5",
+            // 5.x 小版本曾漏配，导致 opus-5.5 usage 缩小 5 倍、客户端不触发自动压缩
+            "claude-opus-5.5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-2",
         ] {
             assert_eq!(
                 get_context_window_size(model),
