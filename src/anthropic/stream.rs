@@ -1602,6 +1602,8 @@ impl StreamContext {
                     // tokenUsage 是最终快照；同一 provider 流内重复出现时取最后一份，
                     // 不能累加，否则会重复计费。
                     self.provider_token_usage = Some(usage);
+                } else {
+                    tracing::debug!("收到 metadataEvent，但不含 tokenUsage");
                 }
                 Vec::new()
             }
