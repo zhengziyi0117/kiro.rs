@@ -31,6 +31,13 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelApi429Action {
+    Failover,
+    RetryCurrent,
+    Return,
+}
+
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
@@ -1027,54 +1034,78 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 + suspicious activity = 账号级临时风控
-            // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
-            if status.as_u16() == 429
-                && self.token_manager.get_account_throttle_failover()
-                && endpoint.is_account_throttled(&body)
-            {
-                let cooldown_secs = self
-                    .token_manager
-                    .get_account_throttle_cooldown_secs()
-                    .max(1);
-                let cooldown = std::time::Duration::from_secs(cooldown_secs);
-                tracing::warn!(
-                    "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
-                    ctx.id,
-                    cooldown_secs,
-                    attempt + 1,
-                    max_retries,
-                    body
-                );
+            if status.as_u16() == 429 {
+                let account_rate_limited = endpoint.is_account_rate_limited(&body);
+                match model_api_429_action(
+                    account_rate_limited,
+                    self.token_manager.get_account_throttle_failover(),
+                    self.token_manager.get_model_api_429_retry_enabled(),
+                ) {
+                    ModelApi429Action::Failover => {
+                        let cooldown_secs = self
+                            .token_manager
+                            .get_account_throttle_cooldown_secs()
+                            .max(1);
+                        let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                        tracing::warn!(
+                            "API 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                            ctx.id,
+                            cooldown_secs,
+                            attempt + 1,
+                            max_retries,
+                            body
+                        );
 
-                let remaining = self
-                    .token_manager
-                    .report_account_throttled_for_request(
-                        ctx.id,
-                        cooldown,
-                        model.as_deref(),
-                        group,
-                    );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(429),
-                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
-                );
-                // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
-                // 让下游网关在同一时段内也停止调度该虚拟账号。
-                let (rate_limit_error, must_wait_for_upstream) =
-                    account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
-
-                // 上游给出明确等待时间时必须立即交给客户端遵守，不能在同一请求中
-                // 提前换号重试。无有效 Retry-After 时仍允许按既有策略故障转移。
-                if must_wait_for_upstream {
-                    return Err(rate_limit_error.into());
+                        let remaining = self
+                            .token_manager
+                            .report_account_throttled_for_request(
+                                ctx.id,
+                                cooldown,
+                                model.as_deref(),
+                                group,
+                            );
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, endpoint_name, Some(429),
+                            outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                        );
+                        // Retry-After 约束的是刚被限流的账号；故障转移开启时仍可立即
+                        // 尝试其它账号。若最终无账号可用，则把上游值或本地冷却时间
+                        // 返回客户端。
+                        let rate_limit_error =
+                            account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
+                        if remaining == 0 {
+                            return Err(rate_limit_error.into());
+                        }
+                        last_error = Some(rate_limit_error.into());
+                        continue;
+                    }
+                    ModelApi429Action::Return => {
+                        let outcome = if account_rate_limited {
+                            outcome::ACCOUNT_THROTTLED
+                        } else {
+                            outcome::TRANSIENT
+                        };
+                        let reason = if account_rate_limited {
+                            "账号级限流但故障转移已关闭"
+                        } else {
+                            "普通 429 自动重试已关闭"
+                        };
+                        tracing::warn!(
+                            "API 请求失败（{}，直接返回客户端）: {} {}",
+                            reason,
+                            status,
+                            body
+                        );
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, endpoint_name, Some(429),
+                            outcome, Some(&body), attempt_start,
+                        );
+                        return Err(rate_limit_error
+                            .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                            .into());
+                    }
+                    ModelApi429Action::RetryCurrent => {}
                 }
-
-                if remaining == 0 {
-                    return Err(rate_limit_error.into());
-                }
-                last_error = Some(rate_limit_error.into());
-                continue;
             }
 
             // 客户端请求格式错误（messages 数组违反协议）：根因在调用方，重试无意义
@@ -1116,8 +1147,8 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 走到这里的 429 是已允许自动重试的容量类错误；不禁用或切换凭据。
+            // 408/5xx 同样维持既有的当前凭据重试行为。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -1299,19 +1330,33 @@ fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyho
     }
 }
 
-/// 为账号风控 429 补齐本地冷却时间，并区分上游是否明确要求等待。
+fn model_api_429_action(
+    account_rate_limited: bool,
+    failover_enabled: bool,
+    ordinary_retry_enabled: bool,
+) -> ModelApi429Action {
+    if account_rate_limited {
+        if failover_enabled {
+            ModelApi429Action::Failover
+        } else {
+            ModelApi429Action::Return
+        }
+    } else if ordinary_retry_enabled {
+        ModelApi429Action::RetryCurrent
+    } else {
+        ModelApi429Action::Return
+    }
+}
+
+/// 账号级 429 最终返回客户端时，缺少上游 Retry-After 则补上本地冷却时间。
 fn account_rate_limit_with_fallback(
     rate_limit: Option<UpstreamRateLimitError>,
     cooldown_secs: u64,
-) -> (UpstreamRateLimitError, bool) {
-    let must_wait_for_upstream = rate_limit
-        .as_ref()
-        .is_some_and(|error| !error.should_retry_locally());
-    let error = match rate_limit {
+) -> UpstreamRateLimitError {
+    match rate_limit {
         Some(error) if error.retry_after().is_some() => error,
         _ => UpstreamRateLimitError::new(Some(cooldown_secs.to_string())),
-    };
-    (error, must_wait_for_upstream)
+    }
 }
 
 #[cfg(test)]
@@ -1369,24 +1414,46 @@ mod rate_limit_tests {
 
     #[test]
     fn account_rate_limit_uses_cooldown_when_retry_after_is_missing() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
+        let error = account_rate_limit_with_fallback(
             Some(UpstreamRateLimitError::new(None)),
             300,
         );
 
         assert_eq!(error.retry_after(), Some("300"));
-        assert!(!must_wait, "无上游等待值时仍可按账号冷却策略故障转移");
     }
 
     #[test]
-    fn account_rate_limit_honors_explicit_upstream_retry_after() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
+    fn account_rate_limit_preserves_explicit_upstream_retry_after() {
+        let error = account_rate_limit_with_fallback(
             Some(UpstreamRateLimitError::new(Some("90".to_string()))),
             300,
         );
 
         assert_eq!(error.retry_after(), Some("90"));
-        assert!(must_wait, "上游明确要求等待时不得在内部提前重试");
+    }
+
+    #[test]
+    fn account_rate_limit_only_uses_failover_switch() {
+        assert_eq!(
+            model_api_429_action(true, true, false),
+            ModelApi429Action::Failover
+        );
+        assert_eq!(
+            model_api_429_action(true, false, true),
+            ModelApi429Action::Return
+        );
+    }
+
+    #[test]
+    fn ordinary_rate_limit_only_uses_retry_switch() {
+        assert_eq!(
+            model_api_429_action(false, false, true),
+            ModelApi429Action::RetryCurrent
+        );
+        assert_eq!(
+            model_api_429_action(false, true, false),
+            ModelApi429Action::Return
+        );
     }
 
     #[test]
