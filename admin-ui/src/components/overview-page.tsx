@@ -250,6 +250,8 @@ interface RangeStats {
   errors: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
 }
 
 function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
@@ -260,8 +262,10 @@ function aggregateSeries(data: TimeSeriesPoint[]): RangeStats {
       errors: acc.errors + p.errors,
       inputTokens: acc.inputTokens + p.inputTokens,
       outputTokens: acc.outputTokens + p.outputTokens,
+      cacheCreationTokens: acc.cacheCreationTokens + (p.cacheCreationTokens ?? 0),
+      cacheReadTokens: acc.cacheReadTokens + (p.cacheReadTokens ?? 0),
     }),
-    { calls: 0, credits: 0, errors: 0, inputTokens: 0, outputTokens: 0 },
+    { calls: 0, credits: 0, errors: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 },
   )
 }
 
@@ -276,6 +280,9 @@ function StatsCards({
   stats: RangeStats
   timeText: string
 }) {
+  // inputTokens 只是未命中缓存的部分；总输入 = 未缓存 + 缓存写 + 缓存读
+  const totalInput = stats.inputTokens + stats.cacheCreationTokens + stats.cacheReadTokens
+  const hitRate = totalInput > 0 ? ((stats.cacheReadTokens / totalInput) * 100).toFixed(1) : '0'
   const cards = [
     {
       icon: <Activity className="h-4 w-4" />,
@@ -285,7 +292,17 @@ function StatsCards({
         <Badge variant="destructive">异常 {formatNumber(stats.errors)}</Badge>
       ) : null,
     },
-    { icon: <Cpu className="h-4 w-4" />, label: '输入 Token', value: formatNumber(stats.inputTokens) },
+    {
+      icon: <Cpu className="h-4 w-4" />,
+      label: '输入 Token（含缓存）',
+      value: formatNumber(totalInput),
+      extra: (
+        <div className="text-right text-[11px] leading-4 text-muted-foreground">
+          <div>缓存读 {formatNumber(stats.cacheReadTokens)} · 命中 {hitRate}%</div>
+          <div>未缓存 {formatNumber(stats.inputTokens)} · 缓存写 {formatNumber(stats.cacheCreationTokens)}</div>
+        </div>
+      ),
+    },
     { icon: <Cpu className="h-4 w-4" />, label: '输出 Token', value: formatNumber(stats.outputTokens) },
     {
       icon: <Coins className="h-4 w-4" />,
