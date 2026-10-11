@@ -2586,7 +2586,7 @@ impl StreamContext {
 
         // 只有 thinking、没有 text / tool_use：仅当上游确实报告截断（如
         // ContentLengthExceededException 已置 max_tokens）时才补一个空格 text 块正常收尾；
-        // 否则视为上游空回复（见下方 overloaded_error），不能伪装成 max_tokens——
+        // 否则视为上游空回复（见下方 api_error），不能伪装成 max_tokens——
         // 客户端会显示“被截断”且不重试，实际 token 预算远未用完。
         let thinking_only =
             self.thinking_block_index.is_some() && !self.state_manager.has_non_thinking_blocks();
@@ -2632,22 +2632,23 @@ impl StreamContext {
             return events;
         }
 
-        // 上游正常收尾但没有任何文本 / 工具调用（空回复或只有 thinking）：以可重试的
-        // overloaded_error 结束，让客户端重试或至少显式报错，而不是收到空 end_turn 后停住。
+        // 上游正常收尾但没有任何文本 / 工具调用（空回复或只有 thinking）：多为模型拒答整段
+        // 上下文，重试无用。以不可重试的 api_error 显式报错（消息需避开客户端重试关键词如
+        // overloaded/timeout），而不是空 end_turn 停住或伪装 max_tokens 触发压缩。
         if self.output_tokens == 0
             || (thinking_only && !truncated && !self.state_manager.has_non_thinking_blocks())
         {
             let message = format!(
-                "Upstream returned {} (events: [{}])",
+                "Upstream returned {}; the model likely declined this conversation, start a new session (events: [{}])",
                 if self.output_tokens == 0 {
                     "an empty response"
                 } else {
                     "only thinking without an answer"
                 },
-                self.upstream_event_kinds.join(", ")
+                Self::summarize_event_kinds(&self.upstream_event_kinds)
             );
             tracing::warn!(model = %self.model, "{}", message);
-            events.extend(self.generate_error_events("overloaded_error", &message));
+            events.extend(self.generate_error_events("api_error", &message));
             self.empty_response_error = Some(message);
             return events;
         }
@@ -2666,6 +2667,22 @@ impl StreamContext {
         ));
 
         events
+    }
+
+    /// 把事件类型序列折叠为 `a×3, b, c`，避免空回复报错里堆满重复的 reasoningContent。
+    fn summarize_event_kinds(kinds: &[&str]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < kinds.len() {
+            let run = kinds[i..].iter().take_while(|k| **k == kinds[i]).count();
+            parts.push(if run > 1 {
+                format!("{}×{run}", kinds[i])
+            } else {
+                kinds[i].to_string()
+            });
+            i += run;
+        }
+        parts.join(", ")
     }
 
     /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
@@ -3049,13 +3066,26 @@ mod tests {
         );
         let _ = ctx.generate_initial_events();
         let _ = ctx.process_kiro_event(&Event::Unknown {});
+        let _ = ctx.process_kiro_event(&Event::Unknown {});
 
         let final_events = ctx.generate_final_events();
         let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
         assert!(kinds.contains(&"error"), "{kinds:?}");
         assert!(!kinds.contains(&"message_stop"), "{kinds:?}");
+        let err = final_events.iter().find(|e| e.event == "error").unwrap();
+        assert_eq!(err.data["error"]["type"], json!("api_error"));
         let msg = ctx.empty_response_message().expect("应置位空回复错误");
-        assert!(msg.contains("unknown"), "{msg}");
+        assert!(msg.contains("unknown×2"), "{msg}");
+        // 拒答重试无用：消息不能命中 pi 的可重试关键词
+        for kw in [
+            "overloaded",
+            "timeout",
+            "terminated",
+            "ended without",
+            "server error",
+        ] {
+            assert!(!msg.to_lowercase().contains(kw), "{msg}");
+        }
     }
 
     #[test]

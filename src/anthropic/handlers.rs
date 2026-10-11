@@ -1178,7 +1178,7 @@ fn create_sse_stream(
                                     None,
                                 );
                             } else if let Some(message) = ctx.empty_response_message() {
-                                settlement.finish("error", "error", Some(outcome::TRANSIENT), Some(&message), None);
+                                settlement.finish("error", "error", Some(outcome::UNKNOWN), Some(&message), None);
                             } else {
                                 settlement.finish("success", "success", None, None, None);
                             }
@@ -2233,7 +2233,7 @@ fn create_buffered_sse_stream(
                                         None,
                                     );
                                 } else if let Some(message) = ctx.empty_response_message() {
-                                    settlement.finish("error", "error", Some(outcome::TRANSIENT), Some(&message), None);
+                                    settlement.finish("error", "error", Some(outcome::UNKNOWN), Some(&message), None);
                                 } else {
                                     settlement.finish("success", "success", None, None, None);
                                 }
