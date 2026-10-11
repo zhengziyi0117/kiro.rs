@@ -2584,14 +2584,17 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
+        // 只有 thinking、没有 text / tool_use：仅当上游确实报告截断（如
+        // ContentLengthExceededException 已置 max_tokens）时才补一个空格 text 块正常收尾；
+        // 否则视为上游空回复（见下方 overloaded_error），不能伪装成 max_tokens——
+        // 客户端会显示“被截断”且不重试，实际 token 预算远未用完。
+        let thinking_only =
+            self.thinking_block_index.is_some() && !self.state_manager.has_non_thinking_blocks();
+        let truncated = matches!(
+            self.state_manager.stop_reason.as_deref(),
+            Some("max_tokens" | "model_context_window_exceeded")
+        );
+        if thinking_only && truncated {
             events.extend(self.create_text_delta_events(" "));
         }
 
@@ -2629,11 +2632,18 @@ impl StreamContext {
             return events;
         }
 
-        // 上游正常收尾但没有任何文本 / thinking / 工具调用：以可重试的 overloaded_error
-        // 结束，让客户端重试或至少显式报错，而不是收到空 end_turn 后停住。
-        if self.output_tokens == 0 {
+        // 上游正常收尾但没有任何文本 / 工具调用（空回复或只有 thinking）：以可重试的
+        // overloaded_error 结束，让客户端重试或至少显式报错，而不是收到空 end_turn 后停住。
+        if self.output_tokens == 0
+            || (thinking_only && !truncated && !self.state_manager.has_non_thinking_blocks())
+        {
             let message = format!(
-                "Upstream returned an empty response (events: [{}])",
+                "Upstream returned {} (events: [{}])",
+                if self.output_tokens == 0 {
+                    "an empty response"
+                } else {
+                    "only thinking without an answer"
+                },
                 self.upstream_event_kinds.join(", ")
             );
             tracing::warn!(model = %self.model, "{}", message);
@@ -4757,7 +4767,7 @@ mod tests {
 
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+        // 上游报告截断且只有 thinking 块：stop_reason 为 max_tokens 并补空格 text 块
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4769,6 +4779,10 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all_events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".into(),
+            message: String::new(),
+        }));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -4813,6 +4827,29 @@ mod tests {
                     && e.data["index"].as_i64() == Some(text_block_index)
             }),
             "text block should be stopped"
+        );
+    }
+
+    #[test]
+    fn test_thinking_only_without_truncation_ends_with_error() {
+        // 只有 thinking、上游未报截断：不能伪装成 max_tokens，应以可重试 error 结束
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("<thinking>\nabc</thinking>");
+        let final_events = ctx.generate_final_events();
+        let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
+        assert!(kinds.contains(&"error"), "{kinds:?}");
+        assert!(!kinds.contains(&"message_stop"), "{kinds:?}");
+        assert!(
+            ctx.empty_response_message()
+                .unwrap()
+                .contains("only thinking")
         );
     }
 
