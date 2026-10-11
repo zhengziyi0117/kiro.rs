@@ -120,7 +120,6 @@ export function OverviewPage() {
   const keyData = useMemo(() => byKey ?? [], [byKey])
   const rangeStats = useMemo(() => aggregateSeries(seriesData), [seriesData])
   const selectedKeyLabel = selectedStatsKeyLabel(filters.keyFilter, keysData?.keys ?? [])
-  const groupFilterActive = filters.groupFilter !== 'all'
 
   return (
     <div>
@@ -156,13 +155,16 @@ export function OverviewPage() {
         groupFilter={filters.groupFilter}
         groupOptions={groupOptions}
         onGroupChange={filters.setGroupFilter}
+        modelFilter={filters.modelFilter}
+        modelOptions={modelData.map((m) => m.model)}
+        onModelChange={filters.setModelFilter}
       />
       <TrendCard
         customEndDate={filters.customEndDate}
         customStartDate={filters.customStartDate}
         draftGranularity={filters.draftGranularity}
         draftRange={filters.draftRange}
-        keyFilter={filters.keyFilter}
+        keyFilter={`${filters.keyFilter}:${filters.modelFilter}`}
         seriesData={seriesData}
         timeFilter={filters.timeFilter}
         onApplyCustomRange={filters.applyCustomRange}
@@ -175,7 +177,7 @@ export function OverviewPage() {
         byCred={credData}
         byModel={modelData}
         timeText={timeLabel(filters.timeFilter)}
-        groupFilterActive={groupFilterActive}
+        selectedModel={filters.modelFilter}
       />
       <KeyPanel
         data={keyData}
@@ -197,12 +199,14 @@ function useOverviewFilters() {
   const [draftRange, setDraftRange] = useState<StatsRange | undefined>('24h')
   const [keyFilter, setKeyFilter] = useState('all')
   const [groupFilter, setGroupFilter] = useState('all')
+  const [modelFilter, setModelFilter] = useState('all')
   const statsFilter = useMemo<StatsFilter>(() => {
     const f: StatsFilter = {}
     if (keyFilter !== 'all') f.keyId = Number(keyFilter)
     if (groupFilter !== 'all') f.group = groupFilter
+    if (modelFilter !== 'all') f.model = modelFilter
     return f
-  }, [keyFilter, groupFilter])
+  }, [keyFilter, groupFilter, modelFilter])
   const applyCustomRange = () => {
     setTimeFilter(customTimeFilter(customStartDate, customEndDate, draftGranularity))
   }
@@ -234,6 +238,8 @@ function useOverviewFilters() {
     setDraftGranularity,
     setKeyFilter,
     setGroupFilter,
+    modelFilter,
+    setModelFilter,
     statsFilter,
     timeFilter,
   }
@@ -341,6 +347,9 @@ function StatsFilters({
   groupFilter,
   groupOptions,
   onGroupChange,
+  modelFilter,
+  modelOptions,
+  onModelChange,
 }: {
   keyFilter: string
   keys: ClientKeyItem[]
@@ -349,7 +358,14 @@ function StatsFilters({
   groupFilter: string
   groupOptions: string[]
   onGroupChange: (value: string) => void
+  modelFilter: string
+  modelOptions: string[]
+  onModelChange: (value: string) => void
 }) {
+  // 当前选中的模型在新时间窗里可能没数据，仍保留在选项里避免 Select 显示空白
+  const models = modelFilter !== 'all' && !modelOptions.includes(modelFilter)
+    ? [modelFilter, ...modelOptions]
+    : modelOptions
   return (
     <section aria-label="统计筛选" className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0 flex-1">
@@ -357,6 +373,7 @@ function StatsFilters({
         <div className="truncate text-[12px] text-muted-foreground">
           {selectedLabel}
           {groupFilter !== 'all' && ` · 分组：${groupFilter}`}
+          {modelFilter !== 'all' && ` · 模型：${modelFilter}`}
         </div>
       </div>
       <div className="flex flex-col gap-2 sm:flex-row">
@@ -384,6 +401,20 @@ function StatsFilters({
             {groupOptions.map((g) => (
               <SelectItem key={g} value={g}>
                 {g}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {/* 模型筛选：影响卡片 / 趋势 / 凭据 / Key 分布；模型分布本身始终展示全部 */}
+        <Select value={modelFilter} onValueChange={onModelChange}>
+          <SelectTrigger aria-label="模型筛选" className="h-8 w-full sm:w-[200px]">
+            <SelectValue placeholder="全部模型" />
+          </SelectTrigger>
+          <SelectContent align="end">
+            <SelectItem value="all">全部模型</SelectItem>
+            {models.map((m) => (
+              <SelectItem key={m} value={m}>
+                {m}
               </SelectItem>
             ))}
           </SelectContent>
@@ -590,16 +621,16 @@ function DistributionPanels({
   byCred,
   byModel,
   timeText,
-  groupFilterActive,
+  selectedModel,
 }: {
   byCred: CredentialDistribution[]
   byModel: ModelDistribution[]
   timeText: string
-  groupFilterActive: boolean
+  selectedModel: string
 }) {
   return (
     <div className="mb-6 grid gap-4 lg:grid-cols-2">
-      <ModelPanel data={byModel} timeText={timeText} groupFilterActive={groupFilterActive} />
+      <ModelPanel data={byModel} timeText={timeText} selectedModel={selectedModel} />
       <CredentialPanel data={byCred} />
     </div>
   )
@@ -608,11 +639,11 @@ function DistributionPanels({
 function ModelPanel({
   data,
   timeText,
-  groupFilterActive,
+  selectedModel,
 }: {
   data: ModelDistribution[]
   timeText: string
-  groupFilterActive: boolean
+  selectedModel: string
 }) {
   return (
     <Card>
@@ -621,40 +652,51 @@ function ModelPanel({
           <h2 className="text-base font-semibold tracking-tight">按模型分布</h2>
           <span className="text-[11px] text-muted-foreground">{timeText}</span>
         </div>
-        {groupFilterActive && (
-          <p className="mb-3 rounded-md bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-600">
-            当前已启用「分组筛选」。模型分布暂未细分到分组维度，本卡片显示的是
-            <strong className="mx-0.5">不区分分组</strong>的模型聚合结果。
-          </p>
-        )}
         <ModelPieChart data={data} />
-        {data.length > 0 && <ModelTable data={data} />}
+        {data.length > 0 && <ModelTable data={data} selectedModel={selectedModel} />}
       </CardContent>
     </Card>
   )
 }
 
-function ModelTable({ data }: { data: ModelDistribution[] }) {
+function ModelTable({ data, selectedModel }: { data: ModelDistribution[]; selectedModel: string }) {
   return (
-    <div className="mt-3 max-h-32 overflow-auto text-[12px]">
-      <table className="min-w-[420px] w-full">
+    <div className="mt-3 max-h-48 overflow-auto text-[12px]">
+      <table className="min-w-[600px] w-full">
         <thead className="text-muted-foreground">
           <tr>
             <th className="text-left font-medium pb-1">模型</th>
             <th className="text-right font-medium">调用</th>
-            <th className="text-right font-medium">输入</th>
+            <th className="text-right font-medium" title="未缓存 + 缓存写 + 缓存读">总输入</th>
+            <th className="text-right font-medium">缓存读</th>
+            <th className="text-right font-medium">缓存写</th>
+            <th className="text-right font-medium" title="缓存读 / 总输入">命中率</th>
             <th className="text-right font-medium">输出</th>
+            <th className="text-right font-medium">Credit</th>
           </tr>
         </thead>
         <tbody>
-          {data.map((m) => (
-            <tr key={m.model} className="border-t border-border/40">
-              <td className="py-1 truncate">{m.model}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
-              <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
-            </tr>
-          ))}
+          {data.map((m) => {
+            const totalInput = m.inputTokens + m.cacheCreationTokens + m.cacheReadTokens
+            const hit = totalInput > 0 ? `${((m.cacheReadTokens / totalInput) * 100).toFixed(1)}%` : '-'
+            return (
+              <tr
+                key={m.model}
+                className={cn('border-t border-border/40', m.model === selectedModel && 'bg-primary/10 font-medium')}
+              >
+                <td className="py-1 max-w-[180px] truncate" title={m.model}>{m.model}</td>
+                <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
+                <td className="text-right tabular-nums" title={`未缓存 ${formatNumber(m.inputTokens)}`}>
+                  {formatNumber(totalInput)}
+                </td>
+                <td className="text-right tabular-nums">{formatNumber(m.cacheReadTokens)}</td>
+                <td className="text-right tabular-nums">{formatNumber(m.cacheCreationTokens)}</td>
+                <td className="text-right tabular-nums">{hit}</td>
+                <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
+                <td className="text-right tabular-nums">{formatCredits(m.credits)}</td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>

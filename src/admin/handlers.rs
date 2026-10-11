@@ -1273,10 +1273,10 @@ fn parse_key_id(params: &HashMap<String, String>) -> Result<Option<u64>, String>
     }
 }
 
-/// 解析可选的分组筛选参数。空字符串视为不传。
-fn parse_group_filter(params: &HashMap<String, String>) -> Option<String> {
+/// 解析可选的文本筛选参数（group / model）。空字符串视为不传。
+fn parse_text_filter(params: &HashMap<String, String>, name: &str) -> Option<String> {
     params
-        .get("group")
+        .get(name)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -1396,11 +1396,16 @@ pub async fn stats_timeseries(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let group = parse_group_filter(&params);
+    let group = parse_text_filter(&params, "group");
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
     let points = state
         .usage_aggregator
-        .query_timeseries(window, key_id, cred_ids.as_ref());
+        .query_timeseries(
+            window,
+            key_id,
+            cred_ids.as_ref(),
+            parse_text_filter(&params, "model").as_deref(),
+        );
     Json(points).into_response()
 }
 
@@ -1413,7 +1418,12 @@ pub async fn stats_by_model(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let data = state.usage_aggregator.query_by_model(window, key_id);
+    // 模型分布本身不吃 model 筛选：前端要用它列出全部模型
+    let group = parse_text_filter(&params, "group");
+    let cred_ids = group_to_cred_ids(&state, group.as_deref());
+    let data = state
+        .usage_aggregator
+        .query_by_model(window, key_id, cred_ids.as_ref());
     Json(data).into_response()
 }
 
@@ -1426,7 +1436,7 @@ pub async fn stats_by_credential(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let group = parse_group_filter(&params);
+    let group = parse_text_filter(&params, "group");
     // 拉一份凭据快照（既给响应附加 email，也用来按 group 构建 cred_ids 白名单，
     // 避免分别查两次）
     let snapshot = state.service.get_all_credentials();
@@ -1445,7 +1455,12 @@ pub async fn stats_by_credential(
     });
     let data = state
         .usage_aggregator
-        .query_by_credential(window, key_id, cred_ids.as_ref());
+        .query_by_credential(
+            window,
+            key_id,
+            cred_ids.as_ref(),
+            parse_text_filter(&params, "model").as_deref(),
+        );
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1473,9 +1488,13 @@ pub async fn stats_by_key(
         Ok(w) => w,
         Err(message) => return stats_bad_request(message),
     };
-    let group = parse_group_filter(&params);
+    let group = parse_text_filter(&params, "group");
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    let data = state.usage_aggregator.query_by_key(
+        window,
+        cred_ids.as_ref(),
+        parse_text_filter(&params, "model").as_deref(),
+    );
     // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
     let key_name_map: HashMap<u64, String> = state
         .client_keys

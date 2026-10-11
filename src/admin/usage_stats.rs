@@ -218,6 +218,8 @@ struct BucketEntry {
     by_credential: HashMap<u64, BucketStats>,
     by_key_model: HashMap<u64, HashMap<String, BucketStats>>,
     by_key_credential: HashMap<u64, HashMap<u64, BucketStats>>,
+    /// (key, credential, model) 全维度明细，供模型筛选等组合过滤使用
+    detail: HashMap<(u64, u64, String), BucketStats>,
 }
 
 /// 时间维度聚合器
@@ -313,6 +315,10 @@ pub struct ModelDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub errors: u64,
+    pub credits: f64,
 }
 
 /// 上游凭据分布
@@ -450,6 +456,7 @@ impl UsageAggregator {
         window: StatsQueryWindow,
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        model: Option<&str>,
     ) -> Vec<TimeSeriesPoint> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
@@ -461,6 +468,13 @@ impl UsageAggregator {
             .map(|b| {
                 // 不带 group 过滤 → 走老逻辑（更快，命中预聚合 by_key/overall 桶）
                 let stats = match cred_filter {
+                    _ if model.is_some() => {
+                        let mut s = BucketStats::default();
+                        for (_, _, _, ds) in detail_matching(b, key_id, cred_filter, model) {
+                            s.add_stats(ds);
+                        }
+                        s
+                    }
                     None => stats_for_key(b, key_id),
                     Some(allow) => credential_group_for_key(b, key_id)
                         .map(|group| {
@@ -495,19 +509,14 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         key_id: Option<u64>,
+        cred_filter: Option<&std::collections::HashSet<u64>>,
     ) -> Vec<ModelDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
         let mut acc: HashMap<String, BucketStats> = HashMap::new();
         for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
-            let Some(group) = model_group_for_key(b, key_id) else {
-                continue;
-            };
-            for (model, stats) in group {
-                let entry = acc.entry(model.clone()).or_default();
-                entry.input_tokens += stats.input_tokens;
-                entry.output_tokens += stats.output_tokens;
-                entry.calls += stats.calls;
+            for (_, _, model, stats) in detail_matching(b, key_id, cred_filter, None) {
+                acc.entry(model.to_string()).or_default().add_stats(stats);
             }
         }
         let mut out: Vec<ModelDistribution> = acc
@@ -517,6 +526,10 @@ impl UsageAggregator {
                 calls: stats.calls,
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
+                errors: stats.errors,
+                credits: stats.credits,
             })
             .collect();
         out.sort_by(|a, b| b.calls.cmp(&a.calls));
@@ -529,11 +542,20 @@ impl UsageAggregator {
         window: StatsQueryWindow,
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        model: Option<&str>,
     ) -> Vec<CredentialDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
         let mut acc: HashMap<u64, BucketStats> = HashMap::new();
         for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            if model.is_some() {
+                for (_, cid, _, stats) in detail_matching(b, key_id, cred_filter, model) {
+                    if cid != 0 {
+                        acc.entry(cid).or_default().add_stats(stats);
+                    }
+                }
+                continue;
+            }
             let Some(group) = credential_group_for_key(b, key_id) else {
                 continue;
             };
@@ -572,11 +594,18 @@ impl UsageAggregator {
         &self,
         window: StatsQueryWindow,
         cred_filter: Option<&std::collections::HashSet<u64>>,
+        model: Option<&str>,
     ) -> Vec<KeyDistribution> {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
         let mut acc: HashMap<u64, BucketStats> = HashMap::new();
         for b in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            if model.is_some() {
+                for (kid, _, _, stats) in detail_matching(b, None, cred_filter, model) {
+                    acc.entry(kid).or_default().add_stats(stats);
+                }
+                continue;
+            }
             match cred_filter {
                 None => {
                     for (key_id, stats) in &b.by_key {
@@ -700,6 +729,11 @@ fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
         .entry(rec.model.clone())
         .or_default()
         .add(rec);
+    bucket
+        .detail
+        .entry((rec.key_id, rec.credential_id, rec.model.clone()))
+        .or_default()
+        .add(rec);
     if rec.credential_id == 0 {
         return;
     }
@@ -733,14 +767,22 @@ fn credential_group_for_key(
     }
 }
 
-fn model_group_for_key(
-    bucket: &BucketEntry,
+/// 按 key / 凭据白名单 / 模型 过滤明细；None 表示该维度不过滤
+fn detail_matching<'a>(
+    bucket: &'a BucketEntry,
     key_id: Option<u64>,
-) -> Option<&HashMap<String, BucketStats>> {
-    match key_id {
-        Some(id) => bucket.by_key_model.get(&id),
-        None => Some(&bucket.by_model),
-    }
+    cred_filter: Option<&'a std::collections::HashSet<u64>>,
+    model: Option<&'a str>,
+) -> impl Iterator<Item = (u64, u64, &'a str, &'a BucketStats)> {
+    bucket
+        .detail
+        .iter()
+        .filter(move |((k, c, m), _)| {
+            key_id.is_none_or(|id| id == *k)
+                && cred_filter.is_none_or(|allow| allow.contains(c))
+                && model.is_none_or(|want| want == m)
+        })
+        .map(|((k, c, m), s)| (*k, *c, m.as_str(), s))
 }
 
 fn bucket_in_window(bucket: &BucketEntry, window: StatsQueryWindow) -> bool {
@@ -805,19 +847,19 @@ mod tests {
         assert_eq!(ov.today_input_tokens, 2000);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, None, None);
+        let series = agg.query_timeseries(window, None, None, None);
         assert!(!series.is_empty());
 
-        let by_model = agg.query_by_model(window, None);
+        let by_model = agg.query_by_model(window, None, None);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "claude-opus-4-7");
         assert_eq!(by_model[0].calls, 2);
 
-        let by_cred = agg.query_by_credential(window, None, None);
+        let by_cred = agg.query_by_credential(window, None, None, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
 
-        let by_key = agg.query_by_key(window, None);
+        let by_key = agg.query_by_key(window, None, None);
         assert_eq!(by_key.len(), 1);
         assert_eq!(by_key[0].key_id, 1);
         assert_eq!(by_key[0].calls, 2);
@@ -846,7 +888,7 @@ mod tests {
         agg.ingest(&mk(2, 6, 300));
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let by_key = agg.query_by_key(window, None);
+        let by_key = agg.query_by_key(window, None, None);
         assert_eq!(by_key.len(), 2);
         // key 2 调用更多 → 排在前面
         assert_eq!(by_key[0].key_id, 2);
@@ -856,7 +898,7 @@ mod tests {
 
         // 分组白名单只放行凭据 5 → 仅 key 1 命中
         let allow: std::collections::HashSet<u64> = [5u64].into_iter().collect();
-        let filtered = agg.query_by_key(window, Some(&allow));
+        let filtered = agg.query_by_key(window, Some(&allow), None);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].key_id, 1);
         assert_eq!(filtered[0].input_tokens, 100);
@@ -896,17 +938,63 @@ mod tests {
         agg.ingest(&rec_b);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, Some(1), None);
+        let series = agg.query_timeseries(window, Some(1), None, None);
         assert_eq!(series.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(series.iter().map(|p| p.input_tokens).sum::<u64>(), 100);
 
-        let by_model = agg.query_by_model(window, Some(1));
+        let by_model = agg.query_by_model(window, Some(1), None);
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "m-a");
 
-        let by_cred = agg.query_by_credential(window, Some(1), None);
+        let by_cred = agg.query_by_credential(window, Some(1), None, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
+    }
+
+    #[test]
+    fn aggregator_filters_by_model_with_cache() {
+        let agg = UsageAggregator::new();
+        let now = Utc::now().to_rfc3339();
+        let mk = |key_id: u64, cred: u64, model: &str, cache_read: u64| UsageRecord {
+            ts: now.clone(),
+            key_id,
+            credential_id: cred,
+            model: model.to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_tokens: 2,
+            cache_read_tokens: cache_read,
+            credits: 0.1,
+            duration_ms: 100,
+            status: "success".to_string(),
+        };
+        agg.ingest(&mk(1, 5, "m-a", 100));
+        agg.ingest(&mk(2, 6, "m-a", 50));
+        agg.ingest(&mk(1, 6, "m-b", 7));
+
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let series = agg.query_timeseries(window, None, None, Some("m-a"));
+        assert_eq!(series.iter().map(|p| p.calls).sum::<u64>(), 2);
+        assert_eq!(series.iter().map(|p| p.cache_read_tokens).sum::<u64>(), 150);
+
+        // key + model 组合
+        let series = agg.query_timeseries(window, Some(1), None, Some("m-a"));
+        assert_eq!(series.iter().map(|p| p.cache_read_tokens).sum::<u64>(), 100);
+
+        // by_model 带缓存字段，且支持分组白名单
+        let allow: std::collections::HashSet<u64> = [6u64].into_iter().collect();
+        let by_model = agg.query_by_model(window, None, Some(&allow));
+        assert_eq!(by_model.len(), 2);
+        let a = by_model.iter().find(|m| m.model == "m-a").unwrap();
+        assert_eq!((a.calls, a.cache_read_tokens, a.cache_creation_tokens), (1, 50, 2));
+
+        let by_cred = agg.query_by_credential(window, None, None, Some("m-b"));
+        assert_eq!(by_cred.len(), 1);
+        assert_eq!(by_cred[0].credential_id, 6);
+
+        let by_key = agg.query_by_key(window, None, Some("m-a"));
+        assert_eq!(by_key.len(), 2);
+        assert_eq!(by_key.iter().map(|k| k.cache_read_tokens).sum::<u64>(), 150);
     }
 
     #[test]
@@ -983,11 +1071,11 @@ mod tests {
             granularity: StatsGranularity::Day,
         };
 
-        let hourly = agg.query_timeseries(hour_window, None, None);
+        let hourly = agg.query_timeseries(hour_window, None, None, None);
         assert_eq!(hourly.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(hourly.iter().map(|p| p.input_tokens).sum::<u64>(), 300);
 
-        let daily = agg.query_timeseries(day_window, None, None);
+        let daily = agg.query_timeseries(day_window, None, None, None);
         assert_eq!(daily.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(daily.iter().map(|p| p.output_tokens).sum::<u64>(), 40);
     }
