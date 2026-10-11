@@ -2586,7 +2586,7 @@ impl StreamContext {
 
         // 只有 thinking、没有 text / tool_use：仅当上游确实报告截断（如
         // ContentLengthExceededException 已置 max_tokens）时才补一个空格 text 块正常收尾；
-        // 否则视为上游空回复（见下方 api_error），不能伪装成 max_tokens——
+        // 否则视为上游拒答（见下方 refusal），不能伪装成 max_tokens——
         // 客户端会显示“被截断”且不重试，实际 token 预算远未用完。
         let thinking_only =
             self.thinking_block_index.is_some() && !self.state_manager.has_non_thinking_blocks();
@@ -2633,12 +2633,14 @@ impl StreamContext {
         }
 
         // 上游正常收尾但没有任何文本 / 工具调用（空回复或只有 thinking）：多为模型拒答整段
-        // 上下文，重试无用。以不可重试的 api_error 显式报错（消息需避开客户端重试关键词如
-        // overloaded/timeout），而不是空 end_turn 停住或伪装 max_tokens 触发压缩。
-        if self.output_tokens == 0
-            || (thinking_only && !truncated && !self.state_manager.has_non_thinking_blocks())
-        {
-            let message = format!(
+        // 上下文，重试无用。Kiro 不下发 refusal，这里按 Messages 协议的拒答格式收尾：
+        // stop_reason=refusal + stop_details（客户端如 pi 会映射为不可重试的错误并展示
+        // explanation），而不是空 end_turn 停住或伪装 max_tokens 触发压缩。
+        // explanation 需避开客户端重试关键词（overloaded/timeout 等）。
+        let refusal_explanation = (self.output_tokens == 0
+            || (thinking_only && !truncated && !self.state_manager.has_non_thinking_blocks()))
+        .then(|| {
+            format!(
                 "Upstream returned {}; the model likely declined this conversation, start a new session (events: [{}])",
                 if self.output_tokens == 0 {
                     "an empty response"
@@ -2646,11 +2648,12 @@ impl StreamContext {
                     "only thinking without an answer"
                 },
                 Self::summarize_event_kinds(&self.upstream_event_kinds)
-            );
-            tracing::warn!(model = %self.model, "{}", message);
-            events.extend(self.generate_error_events("api_error", &message));
-            self.empty_response_error = Some(message);
-            return events;
+            )
+        });
+        if let Some(explanation) = &refusal_explanation {
+            tracing::warn!(model = %self.model, "{}", explanation);
+            self.state_manager.set_stop_reason("refusal");
+            self.empty_response_error = Some(explanation.clone());
         }
 
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
@@ -2658,13 +2661,25 @@ impl StreamContext {
         let final_output_tokens = self.resolved_output_tokens();
 
         // 生成最终事件（message_delta + message_stop）
-        events.extend(self.state_manager.generate_final_events(
+        let final_events = self.state_manager.generate_final_events(
             final_input_tokens,
             final_output_tokens,
             cache_creation,
             cache_read,
             self.metering.as_ref(),
-        ));
+        );
+        events.extend(final_events.into_iter().map(|mut e| {
+            if let Some(explanation) = &refusal_explanation
+                && e.event == "message_delta"
+            {
+                e.data["delta"]["stop_details"] = json!({
+                    "type": "refusal",
+                    "category": null,
+                    "explanation": explanation,
+                });
+            }
+            e
+        }));
 
         events
     }
@@ -3054,7 +3069,7 @@ mod tests {
         Event::AssistantResponse(serde_json::from_value(json!({ "content": text })).unwrap())
     }
 
-    /// 上游正常收尾但没有任何内容事件：必须以 error 终态结束，不能发空 end_turn。
+    /// 上游正常收尾但没有任何内容事件：按协议以 refusal + stop_details 收尾，不能发空 end_turn。
     #[test]
     fn empty_upstream_response_ends_with_error() {
         let mut ctx = StreamContext::new_with_thinking(
@@ -3070,11 +3085,23 @@ mod tests {
 
         let final_events = ctx.generate_final_events();
         let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
-        assert!(kinds.contains(&"error"), "{kinds:?}");
-        assert!(!kinds.contains(&"message_stop"), "{kinds:?}");
-        let err = final_events.iter().find(|e| e.event == "error").unwrap();
-        assert_eq!(err.data["error"]["type"], json!("api_error"));
+        assert!(!kinds.contains(&"error"), "{kinds:?}");
+        assert_eq!(kinds.last(), Some(&"message_stop"), "{kinds:?}");
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], json!("refusal"));
+        assert_eq!(
+            delta.data["delta"]["stop_details"]["type"],
+            json!("refusal")
+        );
+        assert!(delta.data["delta"]["stop_details"]["category"].is_null());
         let msg = ctx.empty_response_message().expect("应置位空回复错误");
+        assert_eq!(
+            delta.data["delta"]["stop_details"]["explanation"],
+            json!(msg)
+        );
         assert!(msg.contains("unknown×2"), "{msg}");
         // 拒答重试无用：消息不能命中 pi 的可重试关键词
         for kw in [
@@ -4861,8 +4888,8 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_only_without_truncation_ends_with_error() {
-        // 只有 thinking、上游未报截断：不能伪装成 max_tokens，应以可重试 error 结束
+    fn test_thinking_only_without_truncation_ends_with_refusal() {
+        // 只有 thinking、上游未报截断：不能伪装成 max_tokens，按协议以 refusal 收尾
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4874,8 +4901,19 @@ mod tests {
         let _ = ctx.process_assistant_response("<thinking>\nabc</thinking>");
         let final_events = ctx.generate_final_events();
         let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
-        assert!(kinds.contains(&"error"), "{kinds:?}");
-        assert!(!kinds.contains(&"message_stop"), "{kinds:?}");
+        assert!(!kinds.contains(&"error"), "{kinds:?}");
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], json!("refusal"));
+        // 不补空格 text 块
+        assert!(
+            !final_events
+                .iter()
+                .any(|e| e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "text")
+        );
         assert!(
             ctx.empty_response_message()
                 .unwrap()
