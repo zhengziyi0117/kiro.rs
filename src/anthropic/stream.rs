@@ -1473,6 +1473,11 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 本次上游流收到的事件类型（按到达顺序），空回复时用于排障日志。
+    upstream_event_kinds: Vec<&'static str>,
+    /// 上游正常结束却没有任何内容时置位；收尾补发 `error` 而非 `end_turn`，
+    /// 否则 Claude Code 等客户端会把空回复当作任务完成而“卡住”。
+    empty_response_error: Option<String>,
 }
 
 impl StreamContext {
@@ -1514,6 +1519,11 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
+    /// 上游空回复错误信息（在 generate_final_events 之后可用）。上层据此记 error。
+    pub fn empty_response_message(&self) -> Option<String> {
+        self.empty_response_error.clone()
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1553,6 +1563,8 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            upstream_event_kinds: Vec::new(),
+            empty_response_error: None,
         }
     }
 
@@ -1619,6 +1631,17 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        self.upstream_event_kinds.push(match event {
+            Event::AssistantResponse(_) => "assistantResponse",
+            Event::ToolUse(_) => "toolUse",
+            Event::ReasoningContent(_) => "reasoningContent",
+            Event::Metadata(_) => "metadata",
+            Event::ContextUsage(_) => "contextUsage",
+            Event::Metering(_) => "metering",
+            Event::Error { .. } => "error",
+            Event::Exception { .. } => "exception",
+            Event::Unknown {} => "unknown",
+        });
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -2606,6 +2629,19 @@ impl StreamContext {
             return events;
         }
 
+        // 上游正常收尾但没有任何文本 / thinking / 工具调用：以可重试的 overloaded_error
+        // 结束，让客户端重试或至少显式报错，而不是收到空 end_turn 后停住。
+        if self.output_tokens == 0 {
+            let message = format!(
+                "Upstream returned an empty response (events: [{}])",
+                self.upstream_event_kinds.join(", ")
+            );
+            tracing::warn!(model = %self.model, "{}", message);
+            events.extend(self.generate_error_events("overloaded_error", &message));
+            self.empty_response_error = Some(message);
+            return events;
+        }
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
@@ -2763,6 +2799,11 @@ impl BufferedStreamContext {
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 上游空回复错误信息（转发内部 StreamContext）。
+    pub fn empty_response_message(&self) -> Option<String> {
+        self.inner.empty_response_message()
     }
 }
 
@@ -2980,6 +3021,31 @@ mod tests {
             .find(|e| e.event == "message_delta")
             .map(|e| e.data["delta"]["stop_reason"].clone());
         assert_eq!(stop_reason, Some(json!("tool_use")));
+    }
+
+    fn text_evt(text: &str) -> Event {
+        Event::AssistantResponse(serde_json::from_value(json!({ "content": text })).unwrap())
+    }
+
+    /// 上游正常收尾但没有任何内容事件：必须以 error 终态结束，不能发空 end_turn。
+    #[test]
+    fn empty_upstream_response_ends_with_error() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Unknown {});
+
+        let final_events = ctx.generate_final_events();
+        let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
+        assert!(kinds.contains(&"error"), "{kinds:?}");
+        assert!(!kinds.contains(&"message_stop"), "{kinds:?}");
+        let msg = ctx.empty_response_message().expect("应置位空回复错误");
+        assert!(msg.contains("unknown"), "{msg}");
     }
 
     #[test]
@@ -5526,6 +5592,7 @@ mod tests {
             unit_plural: "credits".into(),
             usage: 0.42,
         }));
+        ctx.process_kiro_event(&text_evt("hi"));
 
         let final_events = ctx.generate_final_events();
         let delta = final_events
@@ -5550,6 +5617,7 @@ mod tests {
             test_known_tools(),
         );
         let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&text_evt("hi"));
         let final_events = ctx.generate_final_events();
         let delta = final_events
             .iter()
@@ -5690,6 +5758,7 @@ mod tests {
         ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
             token_usage: Some(usage),
         }));
+        ctx.process_and_buffer(&text_evt("hi"));
         let events = ctx.finish_and_get_all_events();
 
         assert_eq!(ctx.final_usage(), (3, 11, 4, 7, 0.0));
