@@ -1306,6 +1306,19 @@ fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularit
             StatsGranularity::parse(s).ok_or_else(|| "granularity 必须是 hour 或 day".to_string())
         }
         None => Err("granularity 必须是 hour 或 day".to_string()),
+    // 精确时间窗（Unix 秒，左闭右开）优先于按天的 startDate/endDate
+    if let (Some(start), Some(end)) = (params.get("startTs"), params.get("endTs")) {
+        let start_ts = start.parse::<i64>().map_err(|_| "startTs 必须是 Unix 秒".to_string())?;
+        let end_ts = end.parse::<i64>().map_err(|_| "endTs 必须是 Unix 秒".to_string())?;
+        if end_ts <= start_ts {
+            return Err("endTs 必须晚于 startTs".to_string());
+        }
+        return Ok(StatsQueryWindow {
+            start_ts,
+            end_ts,
+            granularity,
+        });
+    }
     }
 }
 
@@ -1894,6 +1907,38 @@ pub async fn delete_group(
                 .into_response();
         }
         state.client_keys.clear_group(&name);
+
+#[cfg(test)]
+mod stats_window_tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn exact_ts_window_is_used_and_validated() {
+        let w = parse_stats_window(&params(&[
+            ("granularity", "hour"),
+            ("startTs", "3600"),
+            ("endTs", "7200"),
+        ]))
+        .unwrap();
+        assert_eq!((w.start_ts, w.end_ts), (3600, 7200));
+        assert!(parse_stats_window(&params(&[
+            ("granularity", "hour"),
+            ("startTs", "7200"),
+            ("endTs", "3600"),
+        ]))
+        .is_err());
+        assert!(parse_stats_window(&params(&[
+            ("granularity", "hour"),
+            ("startTs", "x"),
+            ("endTs", "3600"),
+        ]))
+        .is_err());
+    }
+}
     }
 
     state.groups.delete(&name);

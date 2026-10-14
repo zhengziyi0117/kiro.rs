@@ -29,6 +29,8 @@ function timeKey(time: StatsTimeFilter) {
     time.range ?? 'custom',
     time.startDate ?? '',
     time.endDate ?? '',
+    time.startTs ?? 0,
+    time.endTs ?? 0,
     time.granularity,
   ] as const
 }

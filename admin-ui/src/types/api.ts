@@ -501,6 +501,9 @@ export interface StatsTimeFilter {
   range?: StatsRange
   startDate?: string
   endDate?: string
+  /** 精确时间窗（Unix 秒，左闭右开），优先于 startDate/endDate */
+  startTs?: number
+  endTs?: number
   granularity: StatsGranularity
 }
 
