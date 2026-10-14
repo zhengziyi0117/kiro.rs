@@ -1306,6 +1306,11 @@ fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularit
             StatsGranularity::parse(s).ok_or_else(|| "granularity 必须是 hour 或 day".to_string())
         }
         None => Err("granularity 必须是 hour 或 day".to_string()),
+    }
+}
+
+fn parse_stats_window(params: &HashMap<String, String>) -> Result<StatsQueryWindow, String> {
+    let granularity = parse_granularity(params)?;
     // 精确时间窗（Unix 秒，左闭右开）优先于按天的 startDate/endDate
     if let (Some(start), Some(end)) = (params.get("startTs"), params.get("endTs")) {
         let start_ts = start.parse::<i64>().map_err(|_| "startTs 必须是 Unix 秒".to_string())?;
@@ -1319,11 +1324,6 @@ fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularit
             granularity,
         });
     }
-    }
-}
-
-fn parse_stats_window(params: &HashMap<String, String>) -> Result<StatsQueryWindow, String> {
-    let granularity = parse_granularity(params)?;
     match (params.get("startDate"), params.get("endDate")) {
         (Some(start), Some(end)) => custom_stats_window(start, end, granularity),
         (None, None) => Ok(StatsQueryWindow::preset(parse_range(params)?, granularity)),
