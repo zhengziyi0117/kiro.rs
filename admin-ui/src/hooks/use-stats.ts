@@ -29,13 +29,15 @@ function timeKey(time: StatsTimeFilter) {
     time.range ?? 'custom',
     time.startDate ?? '',
     time.endDate ?? '',
+    time.startTs ?? 0,
+    time.endTs ?? 0,
     time.granularity,
   ] as const
 }
 
 export function useTimeSeries(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'timeseries', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryKey: ['stats', 'timeseries', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all', filter?.model ?? 'all'],
     queryFn: () => getTimeSeries(time, filter),
     ...COMMON,
   })
@@ -51,16 +53,16 @@ export function useByModel(time: StatsTimeFilter, filter?: StatsFilter) {
 
 export function useByCredential(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryKey: ['stats', 'by-credential', ...timeKey(time), filter?.keyId ?? 'all', filter?.group ?? 'all', filter?.model ?? 'all'],
     queryFn: () => getByCredential(time, filter),
     ...COMMON,
   })
 }
 
 export function useByKey(time: StatsTimeFilter, filter?: StatsFilter) {
-  // by-key 横向对比所有 Key，仅受时间窗与分组影响（不随 keyId 变化）
+  // by-key 横向对比所有 Key，受时间窗、分组、模型影响（不随 keyId 变化）
   return useQuery({
-    queryKey: ['stats', 'by-key', ...timeKey(time), filter?.group ?? 'all'],
+    queryKey: ['stats', 'by-key', ...timeKey(time), filter?.group ?? 'all', filter?.model ?? 'all'],
     queryFn: () => getByKey(time, filter),
     ...COMMON,
   })

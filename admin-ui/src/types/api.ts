@@ -501,14 +501,19 @@ export interface StatsTimeFilter {
   range?: StatsRange
   startDate?: string
   endDate?: string
+  /** 精确时间窗（Unix 秒，左闭右开），优先于 startDate/endDate */
+  startTs?: number
+  endTs?: number
   granularity: StatsGranularity
 }
 
 export interface StatsFilter {
   /** 不传 = 全部；其它值 = 客户端 Key id */
   keyId?: number
-  /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
+  /** 按账号分组筛选 */
   group?: string
+  /** 按模型筛选（by-model 自身忽略，用于列出全部模型） */
+  model?: string
 }
 
 export interface OverviewStats {
@@ -541,6 +546,10 @@ export interface ModelDistribution {
   calls: number
   inputTokens: number
   outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  errors: number
+  credits: number
 }
 
 export interface CredentialDistribution {

@@ -296,7 +296,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 同 1M
+/// Opus 4.7 / 4.8 及所有 Claude 5.x（sonnet/opus/haiku/fable）同 1M
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -325,18 +325,28 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
-                || mapped == "claude-sonnet-5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
-                || mapped == "claude-opus-5"
-                || mapped == "claude-opus-5.5"
-                || mapped == "claude-fable-5" =>
+                // 5 代及其小版本（opus-5.5、sonnet-5.2…）统一 1M，避免逐个漏配。
+                || is_claude_gen5_1m(&mapped) =>
         {
             1_000_000
         }
         _ => 200_000,
     }
+}
+
+/// 规范化后的 `claude-{sonnet|opus|haiku|fable}-5` 或 `-5.x`（如 `claude-sonnet-5.5`）。
+fn is_claude_gen5_1m(mapped: &str) -> bool {
+    ["claude-sonnet-", "claude-opus-", "claude-haiku-", "claude-fable-"]
+        .iter()
+        .filter_map(|prefix| mapped.strip_prefix(prefix))
+        .any(|version| {
+            let mut parts = version.split('.');
+            parts.next() == Some("5")
+                && parts.all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        })
 }
 
 fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
@@ -363,6 +373,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         || m.contains("mythos-5")
         || m.contains("sonnet-5")
         || m.contains("opus-5")
+        || m.contains("haiku-5")
         || m.contains("claude-5")
 }
 
@@ -2206,6 +2217,16 @@ mod tests {
                 "{model} 应映射到 claude-opus-5.5"
             );
         }
+        for (model, expected) in [
+            ("claude-sonnet-5-5", "claude-sonnet-5.5"),
+            ("claude-sonnet-5.5-thinking", "claude-sonnet-5.5"),
+            ("claude-sonnet-5-5-20270101", "claude-sonnet-5.5"),
+            ("claude-haiku-5-5", "claude-haiku-5.5"),
+            ("claude-haiku-5.5-latest", "claude-haiku-5.5"),
+            ("CLAUDE-HAIKU-5-5", "claude-haiku-5.5"),
+        ] {
+            assert_eq!(map_model(model), Some(expected.to_string()), "{model}");
+        }
         assert_eq!(
             map_model("claude-opus-5-beta"),
             Some("claude-opus-5-beta".to_string())
@@ -2244,6 +2265,13 @@ mod tests {
             "claude-opus-5-5",
             "claude-opus-5.5-thinking",
             "claude-fable-5",
+            // 5.x 小版本曾漏配，导致 opus-5.5 usage 缩小 5 倍、客户端不触发自动压缩
+            "claude-opus-5.5",
+            "claude-sonnet-5-2",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5-thinking",
+            "claude-haiku-5-5",
+            "claude-haiku-5.5",
         ] {
             assert_eq!(
                 get_context_window_size(model),
@@ -2590,6 +2618,8 @@ mod tests {
             "claude-fable-5",
             "claude-sonnet-5",
             "claude-opus-5.5",
+            "claude-sonnet-5.5",
+            "claude-haiku-5.5",
         ] {
             assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
         }

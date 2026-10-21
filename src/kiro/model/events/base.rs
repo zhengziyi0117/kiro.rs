@@ -144,7 +144,15 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Unknown => {
+                // 排障用：确认上游是否下发了未识别的事件（例如换了名字的用量事件）。
+                tracing::debug!(
+                    event_type = event_type_str,
+                    payload_bytes = frame.payload.len(),
+                    "收到未识别的上游事件"
+                );
+                Ok(Self::Unknown {})
+            }
         }
     }
 

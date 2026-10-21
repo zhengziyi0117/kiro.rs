@@ -1291,10 +1291,10 @@ fn parse_key_id(params: &HashMap<String, String>) -> Result<Option<u64>, String>
     }
 }
 
-/// 解析可选的分组筛选参数。空字符串视为不传。
-fn parse_group_filter(params: &HashMap<String, String>) -> Option<String> {
+/// 解析可选的文本筛选参数（group / model）。空字符串视为不传。
+fn parse_text_filter(params: &HashMap<String, String>, name: &str) -> Option<String> {
     params
-        .get("group")
+        .get(name)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -1329,6 +1329,19 @@ fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularit
 
 fn parse_stats_window(params: &HashMap<String, String>) -> Result<StatsQueryWindow, String> {
     let granularity = parse_granularity(params)?;
+    // 精确时间窗（Unix 秒，左闭右开）优先于按天的 startDate/endDate
+    if let (Some(start), Some(end)) = (params.get("startTs"), params.get("endTs")) {
+        let start_ts = start.parse::<i64>().map_err(|_| "startTs 必须是 Unix 秒".to_string())?;
+        let end_ts = end.parse::<i64>().map_err(|_| "endTs 必须是 Unix 秒".to_string())?;
+        if end_ts <= start_ts {
+            return Err("endTs 必须晚于 startTs".to_string());
+        }
+        return Ok(StatsQueryWindow {
+            start_ts,
+            end_ts,
+            granularity,
+        });
+    }
     match (params.get("startDate"), params.get("endDate")) {
         (Some(start), Some(end)) => custom_stats_window(start, end, granularity),
         (None, None) => Ok(StatsQueryWindow::preset(parse_range(params)?, granularity)),
@@ -1414,11 +1427,16 @@ pub async fn stats_timeseries(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let group = parse_group_filter(&params);
+    let group = parse_text_filter(&params, "group");
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
     let points = state
         .usage_aggregator
-        .query_timeseries(window, key_id, cred_ids.as_ref());
+        .query_timeseries(
+            window,
+            key_id,
+            cred_ids.as_ref(),
+            parse_text_filter(&params, "model").as_deref(),
+        );
     Json(points).into_response()
 }
 
@@ -1431,7 +1449,12 @@ pub async fn stats_by_model(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let data = state.usage_aggregator.query_by_model(window, key_id);
+    // 模型分布本身不吃 model 筛选：前端要用它列出全部模型
+    let group = parse_text_filter(&params, "group");
+    let cred_ids = group_to_cred_ids(&state, group.as_deref());
+    let data = state
+        .usage_aggregator
+        .query_by_model(window, key_id, cred_ids.as_ref());
     Json(data).into_response()
 }
 
@@ -1444,7 +1467,7 @@ pub async fn stats_by_credential(
         Ok(parts) => parts,
         Err(message) => return stats_bad_request(message),
     };
-    let group = parse_group_filter(&params);
+    let group = parse_text_filter(&params, "group");
     // 拉一份凭据快照（既给响应附加 email，也用来按 group 构建 cred_ids 白名单，
     // 避免分别查两次）
     let snapshot = state.service.get_all_credentials();
@@ -1463,7 +1486,12 @@ pub async fn stats_by_credential(
     });
     let data = state
         .usage_aggregator
-        .query_by_credential(window, key_id, cred_ids.as_ref());
+        .query_by_credential(
+            window,
+            key_id,
+            cred_ids.as_ref(),
+            parse_text_filter(&params, "model").as_deref(),
+        );
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -1491,9 +1519,13 @@ pub async fn stats_by_key(
         Ok(w) => w,
         Err(message) => return stats_bad_request(message),
     };
-    let group = parse_group_filter(&params);
+    let group = parse_text_filter(&params, "group");
     let cred_ids = group_to_cred_ids(&state, group.as_deref());
-    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    let data = state.usage_aggregator.query_by_key(
+        window,
+        cred_ids.as_ref(),
+        parse_text_filter(&params, "model").as_deref(),
+    );
     // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
     let key_name_map: HashMap<u64, String> = state
         .client_keys
@@ -1893,6 +1925,38 @@ pub async fn delete_group(
                 .into_response();
         }
         state.client_keys.clear_group(&name);
+
+#[cfg(test)]
+mod stats_window_tests {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn exact_ts_window_is_used_and_validated() {
+        let w = parse_stats_window(&params(&[
+            ("granularity", "hour"),
+            ("startTs", "3600"),
+            ("endTs", "7200"),
+        ]))
+        .unwrap();
+        assert_eq!((w.start_ts, w.end_ts), (3600, 7200));
+        assert!(parse_stats_window(&params(&[
+            ("granularity", "hour"),
+            ("startTs", "7200"),
+            ("endTs", "3600"),
+        ]))
+        .is_err());
+        assert!(parse_stats_window(&params(&[
+            ("granularity", "hour"),
+            ("startTs", "x"),
+            ("endTs", "3600"),
+        ]))
+        .is_err());
+    }
+}
     }
 
     state.groups.delete(&name);

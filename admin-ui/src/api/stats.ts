@@ -32,6 +32,7 @@ function statsParams(time: StatsTimeFilter, filter?: StatsFilter) {
     ...time,
     ...(filter?.keyId !== undefined ? { keyId: filter.keyId } : {}),
     ...(filter?.group ? { group: filter.group } : {}),
+    ...(filter?.model ? { model: filter.model } : {}),
   }
 }
 
@@ -43,8 +44,9 @@ export async function getTimeSeries(time: StatsTimeFilter, filter?: StatsFilter)
 }
 
 export async function getByModel(time: StatsTimeFilter, filter?: StatsFilter): Promise<ModelDistribution[]> {
+  // 模型分布不带 model 筛选：需要完整模型列表做下拉与对比
   const { data } = await api.get<ModelDistribution[]>('/stats/by-model', {
-    params: statsParams(time, filter),
+    params: statsParams(time, { ...filter, model: undefined }),
   })
   return data
 }
@@ -59,7 +61,7 @@ export async function getByCredential(time: StatsTimeFilter, filter?: StatsFilte
 export async function getByKey(time: StatsTimeFilter, filter?: StatsFilter): Promise<KeyDistribution[]> {
   // by-key 是横向对比所有 Key，忽略 keyId 过滤；仅透传时间窗与分组
   const { data } = await api.get<KeyDistribution[]>('/stats/by-key', {
-    params: { ...time, ...(filter?.group ? { group: filter.group } : {}) },
+    params: statsParams(time, { ...filter, keyId: undefined }),
   })
   return data
 }

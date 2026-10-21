@@ -174,7 +174,10 @@ impl UsageSource {
     }
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
-    pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
+    pub fn resolve(
+        has_provider_usage: bool,
+        cache_usage: &super::cache_metering::CacheUsage,
+    ) -> Self {
         if has_provider_usage {
             Self::Provider
         } else if cache_usage.cache_covered_est > 0 {
@@ -920,10 +923,9 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -1226,6 +1228,8 @@ fn create_sse_stream(
                                     Some(&message),
                                     None,
                                 );
+                            } else if let Some(message) = ctx.empty_response_message() {
+                                settlement.finish("error", "error", Some(outcome::UNKNOWN), Some(&message), None);
                             } else {
                                 settlement.finish("success", "success", None, None, None);
                             }
@@ -2103,10 +2107,9 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidMessageSequence(reason) => (
-                    "invalid_request_error",
-                    format!("消息序列无效: {}", reason),
-                ),
+                ConversionError::InvalidMessageSequence(reason) => {
+                    ("invalid_request_error", format!("消息序列无效: {}", reason))
+                }
                 ConversionError::UnsupportedToolMapping(reason) => (
                     "invalid_request_error",
                     format!("工具映射不支持: {}", reason),
@@ -2711,10 +2714,12 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Context window is full"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Context window is full")
+        );
     }
 
     #[tokio::test]

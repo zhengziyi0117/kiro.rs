@@ -1481,6 +1481,11 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 本次上游流收到的事件类型（按到达顺序），空回复时用于排障日志。
+    upstream_event_kinds: Vec<&'static str>,
+    /// 上游正常结束却没有任何内容时置位；收尾补发 `error` 而非 `end_turn`，
+    /// 否则 Claude Code 等客户端会把空回复当作任务完成而“卡住”。
+    empty_response_error: Option<String>,
 }
 
 impl StreamContext {
@@ -1522,6 +1527,11 @@ impl StreamContext {
         self.tool_json_error.as_ref().map(|err| err.message())
     }
 
+    /// 上游空回复错误信息（在 generate_final_events 之后可用）。上层据此记 error。
+    pub fn empty_response_message(&self) -> Option<String> {
+        self.empty_response_error.clone()
+    }
+
     /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
@@ -1561,6 +1571,8 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            upstream_event_kinds: Vec::new(),
+            empty_response_error: None,
         }
     }
 
@@ -1627,6 +1639,17 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        self.upstream_event_kinds.push(match event {
+            Event::AssistantResponse(_) => "assistantResponse",
+            Event::ToolUse(_) => "toolUse",
+            Event::ReasoningContent(_) => "reasoningContent",
+            Event::Metadata(_) => "metadata",
+            Event::ContextUsage(_) => "contextUsage",
+            Event::Metering(_) => "metering",
+            Event::Error { .. } => "error",
+            Event::Exception { .. } => "exception",
+            Event::Unknown {} => "unknown",
+        });
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
@@ -1644,6 +1667,8 @@ impl StreamContext {
                     // tokenUsage 是最终快照；同一 provider 流内重复出现时取最后一份，
                     // 不能累加，否则会重复计费。
                     self.provider_token_usage = Some(usage);
+                } else {
+                    tracing::debug!("收到 metadataEvent，但不含 tokenUsage");
                 }
                 if let Some(refusal) = metadata.content_filter_refusal() {
                     tracing::warn!("上游内容过滤拒答: {}", refusal);
@@ -2571,14 +2596,17 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
-        if self.thinking_enabled
-            && self.thinking_block_index.is_some()
-            && !self.state_manager.has_non_thinking_blocks()
-        {
-            self.state_manager.set_stop_reason("max_tokens");
+        // 只有 thinking、没有 text / tool_use：仅当上游确实报告截断（如
+        // ContentLengthExceededException 已置 max_tokens）时才补一个空格 text 块正常收尾；
+        // 否则视为上游拒答（见下方 refusal），不能伪装成 max_tokens——
+        // 客户端会显示“被截断”且不重试，实际 token 预算远未用完。
+        let thinking_only =
+            self.thinking_block_index.is_some() && !self.state_manager.has_non_thinking_blocks();
+        let truncated = matches!(
+            self.state_manager.stop_reason.as_deref(),
+            Some("max_tokens" | "model_context_window_exceeded")
+        );
+        if thinking_only && truncated {
             events.extend(self.create_text_delta_events(" "));
         }
 
@@ -2620,20 +2648,72 @@ impl StreamContext {
             return events;
         }
 
+        // 上游正常收尾但没有任何文本 / 工具调用（空回复或只有 thinking）：多为模型拒答整段
+        // 上下文，重试无用。Kiro 不下发 refusal，这里按 Messages 协议的拒答格式收尾：
+        // stop_reason=refusal + stop_details（客户端如 pi 会映射为不可重试的错误并展示
+        // explanation），而不是空 end_turn 停住或伪装 max_tokens 触发压缩。
+        // explanation 需避开客户端重试关键词（overloaded/timeout 等）。
+        let refusal_explanation = (self.output_tokens == 0
+            || (thinking_only && !truncated && !self.state_manager.has_non_thinking_blocks()))
+        .then(|| {
+            format!(
+                "Upstream returned {}; the model likely declined this conversation, start a new session (events: [{}])",
+                if self.output_tokens == 0 {
+                    "an empty response"
+                } else {
+                    "only thinking without an answer"
+                },
+                Self::summarize_event_kinds(&self.upstream_event_kinds)
+            )
+        });
+        if let Some(explanation) = &refusal_explanation {
+            tracing::warn!(model = %self.model, "{}", explanation);
+            self.state_manager.set_stop_reason("refusal");
+            self.empty_response_error = Some(explanation.clone());
+        }
+
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
         let final_output_tokens = self.resolved_output_tokens();
 
         // 生成最终事件（message_delta + message_stop）
-        events.extend(self.state_manager.generate_final_events(
+        let final_events = self.state_manager.generate_final_events(
             final_input_tokens,
             final_output_tokens,
             cache_creation,
             cache_read,
             self.metering.as_ref(),
-        ));
+        );
+        events.extend(final_events.into_iter().map(|mut e| {
+            if let Some(explanation) = &refusal_explanation
+                && e.event == "message_delta"
+            {
+                e.data["delta"]["stop_details"] = json!({
+                    "type": "refusal",
+                    "category": null,
+                    "explanation": explanation,
+                });
+            }
+            e
+        }));
 
         events
+    }
+
+    /// 把事件类型序列折叠为 `a×3, b, c`，避免空回复报错里堆满重复的 reasoningContent。
+    fn summarize_event_kinds(kinds: &[&str]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < kinds.len() {
+            let run = kinds[i..].iter().take_while(|k| **k == kinds[i]).count();
+            parts.push(if run > 1 {
+                format!("{}×{run}", kinds[i])
+            } else {
+                kinds[i].to_string()
+            });
+            i += run;
+        }
+        parts.join(", ")
     }
 
     /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
@@ -2864,6 +2944,56 @@ mod tests {
             .find(|e| e.event == "message_delta")
             .map(|e| e.data["delta"]["stop_reason"].clone());
         assert_eq!(stop_reason, Some(json!("tool_use")));
+    }
+
+    fn text_evt(text: &str) -> Event {
+        Event::AssistantResponse(serde_json::from_value(json!({ "content": text })).unwrap())
+    }
+
+    /// 上游正常收尾但没有任何内容事件：按协议以 refusal + stop_details 收尾，不能发空 end_turn。
+    #[test]
+    fn empty_upstream_response_ends_with_error() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::Unknown {});
+        let _ = ctx.process_kiro_event(&Event::Unknown {});
+
+        let final_events = ctx.generate_final_events();
+        let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
+        assert!(!kinds.contains(&"error"), "{kinds:?}");
+        assert_eq!(kinds.last(), Some(&"message_stop"), "{kinds:?}");
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], json!("refusal"));
+        assert_eq!(
+            delta.data["delta"]["stop_details"]["type"],
+            json!("refusal")
+        );
+        assert!(delta.data["delta"]["stop_details"]["category"].is_null());
+        let msg = ctx.empty_response_message().expect("应置位空回复错误");
+        assert_eq!(
+            delta.data["delta"]["stop_details"]["explanation"],
+            json!(msg)
+        );
+        assert!(msg.contains("unknown×2"), "{msg}");
+        // 拒答重试无用：消息不能命中 pi 的可重试关键词
+        for kw in [
+            "overloaded",
+            "timeout",
+            "terminated",
+            "ended without",
+            "server error",
+        ] {
+            assert!(!msg.to_lowercase().contains(kw), "{msg}");
+        }
     }
 
     #[test]
@@ -4575,7 +4705,7 @@ mod tests {
 
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
-        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+        // 上游报告截断且只有 thinking 块：stop_reason 为 max_tokens 并补空格 text 块
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4587,6 +4717,10 @@ mod tests {
 
         let mut all_events = Vec::new();
         all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all_events.extend(ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".into(),
+            message: String::new(),
+        }));
         all_events.extend(ctx.generate_final_events());
 
         let message_delta = all_events
@@ -4631,6 +4765,40 @@ mod tests {
                     && e.data["index"].as_i64() == Some(text_block_index)
             }),
             "text block should be stopped"
+        );
+    }
+
+    #[test]
+    fn test_thinking_only_without_truncation_ends_with_refusal() {
+        // 只有 thinking、上游未报截断：不能伪装成 max_tokens，按协议以 refusal 收尾
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_assistant_response("<thinking>\nabc</thinking>");
+        let final_events = ctx.generate_final_events();
+        let kinds: Vec<&str> = final_events.iter().map(|e| e.event.as_str()).collect();
+        assert!(!kinds.contains(&"error"), "{kinds:?}");
+        let delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .unwrap();
+        assert_eq!(delta.data["delta"]["stop_reason"], json!("refusal"));
+        // 不补空格 text 块
+        assert!(
+            !final_events
+                .iter()
+                .any(|e| e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "text")
+        );
+        assert!(
+            ctx.empty_response_message()
+                .unwrap()
+                .contains("only thinking")
         );
     }
 
@@ -5410,6 +5578,7 @@ mod tests {
             unit_plural: "credits".into(),
             usage: 0.42,
         }));
+        ctx.process_kiro_event(&text_evt("hi"));
 
         let final_events = ctx.generate_final_events();
         let delta = final_events
@@ -5434,6 +5603,7 @@ mod tests {
             test_known_tools(),
         );
         let _ = ctx.generate_initial_events();
+        ctx.process_kiro_event(&text_evt("hi"));
         let final_events = ctx.generate_final_events();
         let delta = final_events
             .iter()
@@ -5578,6 +5748,7 @@ mod tests {
             token_usage: Some(usage),
             ..Default::default()
         })));
+        events.extend(ctx.process_kiro_event(&text_evt("hi")));
         events.extend(ctx.generate_final_events());
 
         assert_eq!(ctx.resolved_usage(), (3, 4, 7));
